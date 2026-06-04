@@ -5,6 +5,7 @@ mod error;
 mod grpc;
 mod listener;
 mod lora;
+mod lora_module;
 mod middleware;
 mod routes;
 mod server_info;
@@ -16,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result};
 use axum::{Router, serve::ListenerExt as _};
 pub use config::{Config, CoordinatorMode, HttpListenerMode};
+pub use lora_module::{LoraModuleSpec, LoraModuleSpecError};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep_until};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -30,6 +32,7 @@ use vllm_llm::Llm;
 use vllm_text::TextLlm;
 
 use crate::listener::Listener;
+use crate::lora::LoadLoraError;
 use crate::routes::build_router;
 use crate::server_info::ServerInfoSnapshot;
 use crate::state::AppState;
@@ -95,6 +98,46 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     ))
 }
 
+/// Load each `--lora-modules` spec into the engine before the server begins
+/// accepting traffic. A failure on any one spec aborts startup, matching the
+/// Python frontend's `init_static_loras`.
+pub(crate) async fn load_startup_loras(state: &AppState, specs: &[LoraModuleSpec]) -> Result<()> {
+    for spec in specs {
+        state
+            .load_lora(
+                spec.name.clone(),
+                spec.path.clone(),
+                false,
+                spec.is_3d_lora_weight,
+                spec.base_model_name.clone(),
+            )
+            .await
+            .map_err(|error| describe_startup_lora_error(&spec.name, error))
+            .with_context(|| format!("failed to load startup LoRA module '{}'", spec.name))?;
+        info!(lora_name = %spec.name, lora_path = %spec.path, "loaded startup LoRA module");
+    }
+    Ok(())
+}
+
+fn describe_startup_lora_error(lora_name: &str, error: LoadLoraError) -> anyhow::Error {
+    match error {
+        LoadLoraError::AlreadyLoaded { .. } => {
+            anyhow::anyhow!(
+                "LoRA module '{lora_name}' was listed more than once on the command line"
+            )
+        }
+        LoadLoraError::BaseModelName { .. } => anyhow::anyhow!(
+            "LoRA module name '{lora_name}' conflicts with a served base model name"
+        ),
+        LoadLoraError::Engine(error) => {
+            anyhow::Error::from(error).context(format!("engine rejected LoRA module '{lora_name}'"))
+        }
+        LoadLoraError::NotLoaded { .. } => {
+            anyhow::anyhow!("engine reported LoRA module '{lora_name}' was not loaded")
+        }
+    }
+}
+
 /// Run the OpenAI-compatible HTTP server until the supplied shutdown token is
 /// cancelled.
 ///
@@ -123,6 +166,15 @@ where
         result = build_state(&config) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
+
+    // Load `--lora-modules` adapters before binding the listener so client
+    // requests never see a partially populated registry. Respect the shutdown
+    // token so slow startup loads can still be cancelled.
+    tokio::select! {
+        result = load_startup_loras(&state, &config.lora_modules) => result?,
+        _ = shutdown.cancelled() => return Ok(()),
+    }
+
     let listener = Listener::bind(&config.listener_mode)
         .await
         .context("failed to bind listener for OpenAI server")?;

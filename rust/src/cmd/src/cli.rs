@@ -22,8 +22,8 @@ use vllm_engine_core_client::TransportMode;
 use vllm_managed_engine::ManagedEngineConfig;
 use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_args};
 use vllm_server::{
-    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
-    RendererSelection,
+    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, LoraModuleSpec,
+    ParserSelection, RendererSelection,
 };
 
 use crate::cli::unsupported::UnsupportedArgs;
@@ -191,6 +191,14 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub served_model_name: Vec<String>,
 
+    /// LoRA modules to load at startup. Each value is either `name=path`
+    /// (old format) or a JSON object `{"name": ..., "path": ...,
+    /// "base_model_name": ..., "is_3d_lora_weight": ...}` (new format).
+    /// The flag may be repeated and accepts multiple values per invocation.
+    #[arg(long, num_args = 0..)]
+    #[serde(default)]
+    pub lora_modules: Vec<LoraModuleSpec>,
+
     /// Unsupported Python vLLM frontend arguments recognized but not yet
     /// implemented in Rust.
     #[educe(Debug(ignore))]
@@ -251,6 +259,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            lora_modules: self.lora_modules,
         }
     }
 
@@ -292,6 +301,7 @@ impl SharedRuntimeArgs {
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
+            lora_modules: self.lora_modules,
         }
     }
 }

@@ -1,6 +1,6 @@
 use expect_test::expect;
 use vllm_engine_core_client::TransportMode;
-use vllm_server::{Config, HttpListenerMode, ParserSelection, RendererSelection};
+use vllm_server::{Config, HttpListenerMode, LoraModuleSpec, ParserSelection, RendererSelection};
 
 use super::{Cli, Command};
 
@@ -46,6 +46,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         enable_request_id_headers: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        lora_modules: [],
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "../vllm/.venv/bin/python",
@@ -126,6 +127,52 @@ fn serve_args_accept_explicit_deepseek_v32_renderer() {
         panic!("expected serve args");
     };
     assert_eq!(args.runtime.renderer, RendererSelection::DeepSeekV32);
+}
+
+#[test]
+fn serve_parses_lora_modules_in_both_formats_into_config() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--lora-modules",
+        "sql-lora=/models/sql-lora",
+        "--lora-modules",
+        r#"{"name":"code-lora","path":"/models/code-lora","base_model_name":"Qwen/Qwen3-0.6B","is_3d_lora_weight":true}"#,
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert_eq!(
+        config.lora_modules,
+        vec![
+            LoraModuleSpec {
+                name: "sql-lora".to_string(),
+                path: "/models/sql-lora".to_string(),
+                base_model_name: None,
+                is_3d_lora_weight: false,
+            },
+            LoraModuleSpec {
+                name: "code-lora".to_string(),
+                path: "/models/code-lora".to_string(),
+                base_model_name: Some("Qwen/Qwen3-0.6B".to_string()),
+                is_3d_lora_weight: true,
+            },
+        ]
+    );
+}
+
+#[test]
+fn serve_lora_modules_default_to_empty_when_absent() {
+    let cli = Cli::try_parse_from(["vllm-rs", "serve", "Qwen/Qwen3-0.6B"]).unwrap();
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert!(config.lora_modules.is_empty());
 }
 
 #[test]
@@ -273,6 +320,7 @@ fn frontend_args_accept_json() {
                         enable_request_id_headers: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        lora_modules: [],
                     },
                 },
             ),
@@ -672,6 +720,7 @@ fn serve_args_accept_handshake_aliases() {
                         enable_request_id_headers: false,
                         disable_log_stats: false,
                         served_model_name: [],
+                        lora_modules: [],
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "python3",
@@ -791,6 +840,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            lora_modules: [],
         }
     "#]]
     .assert_debug_eq(&Config {
@@ -854,6 +904,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            lora_modules: [],
         }
     "#]]
     .assert_debug_eq(&config);
@@ -932,6 +983,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             disable_log_stats: false,
             grpc_port: None,
             shutdown_timeout: 0ns,
+            lora_modules: [],
         }
     "#]]
     .assert_debug_eq(&config);

@@ -84,6 +84,11 @@ impl LoraManager {
     }
 
     /// Load one dynamic LoRA adapter and register it as a public model name.
+    ///
+    /// `base_model_name` is only applied to the engine `LoraRequest` if it
+    /// matches one of `base_model_names`; otherwise it is silently dropped,
+    /// matching the Python frontend's behavior.
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_lora(
         &self,
         engine_core_client: &EngineCoreClient,
@@ -92,6 +97,7 @@ impl LoraManager {
         lora_path: String,
         load_inplace: bool,
         is_3d_lora_weight: bool,
+        base_model_name: Option<String>,
     ) -> Result<LoraRequest, LoadLoraError> {
         let _guard = self.update_lock.lock().await;
         if base_model_names.iter().any(|name| name == &lora_name) {
@@ -108,13 +114,16 @@ impl LoraManager {
             .get(&lora_name)
             .map(|request| request.lora_int_id)
             .unwrap_or_else(|| self.id_counter.fetch_add(1, Ordering::Relaxed) + 1);
+        let resolved_base_model_name =
+            base_model_name.filter(|name| base_model_names.iter().any(|b| b == name));
         let lora_request = LoraRequest::new(
             lora_name.clone(),
             lora_int_id,
             lora_path,
             load_inplace,
             is_3d_lora_weight,
-        );
+        )
+        .with_base_model_name(resolved_base_model_name);
 
         let loaded = engine_core_client
             .add_lora(&lora_request)
