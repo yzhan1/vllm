@@ -7,6 +7,8 @@ use serde_json::Value;
 use vllm_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use vllm_engine_core_client::{CoordinatorMode as EngineCoreCoordinatorMode, TransportMode};
 
+use crate::lora_module::LoraModuleSpec;
+
 /// How the HTTP server obtains its listening socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum HttpListenerMode {
@@ -75,6 +77,11 @@ pub struct Config {
     pub grpc_port: Option<u16>,
     /// Maximum time to wait for active HTTP/gRPC requests to drain on shutdown.
     pub shutdown_timeout: Duration,
+    /// LoRA adapters to load at startup, in CLI order. Each entry is loaded
+    /// into the engine before the server begins accepting traffic; a failure
+    /// to load any adapter aborts startup.
+    #[serde(default)]
+    pub lora_modules: Vec<LoraModuleSpec>,
 }
 
 impl Config {

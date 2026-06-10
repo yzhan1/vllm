@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         disable_log_stats: false,
         grpc_port: None,
         shutdown_timeout: Duration::ZERO,
+        lora_modules: Vec::new(),
     };
 
     let bind_address = format!("127.0.0.1:{port}");

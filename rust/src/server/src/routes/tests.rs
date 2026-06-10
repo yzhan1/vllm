@@ -44,7 +44,9 @@ use zeromq::prelude::{SocketRecv, SocketSend};
 use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 
 use super::{build_router, build_router_with_dev_mode, build_router_with_dev_mode_and_lora};
+use crate::load_startup_loras;
 use crate::lora::LoraModelResolution;
+use crate::lora_module::LoraModuleSpec;
 use crate::routes::openai::chat_completions::convert::prepare_chat_request;
 use crate::state::AppState;
 
@@ -814,6 +816,17 @@ async fn test_admin_app_with_engine_script<F>(script: F) -> (axum::Router, MockE
 where
     F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
 {
+    let (state, engine_task) = test_admin_state_with_engine_script(script).await;
+    (
+        build_router_with_dev_mode_and_lora(state, true, true),
+        engine_task,
+    )
+}
+
+async fn test_admin_state_with_engine_script<F>(script: F) -> (Arc<AppState>, MockEngineTask)
+where
+    F: for<'a> FnOnce(&'a mut DealerSocket, &'a mut PushSocket) -> TestFuture<'a> + Send + 'static,
+{
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = b"engine-openai-admin".to_vec();
@@ -837,14 +850,10 @@ where
 
     let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
     (
-        build_router_with_dev_mode_and_lora(
-            Arc::new(AppState::new(
-                vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
-                chat,
-            )),
-            true,
-            true,
-        ),
+        Arc::new(AppState::new(
+            vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+            chat,
+        )),
         engine_task,
     )
 }
@@ -1484,6 +1493,106 @@ async fn load_lora_adapter_rejects_base_model_name_collision() {
         .await
         .expect("call app");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+/// `base_model_name` matching a served base model is threaded onto the engine
+/// `LoraRequest` as part of the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_lora_adapter_threads_matching_base_model_name() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("add_lora"));
+
+            let args = array[3].as_array().expect("utility args");
+            let lora = args[0].as_array().expect("lora request tuple");
+            assert_eq!(lora[0], Value::from("adapter-a"));
+            assert_eq!(lora[1], Value::from(1));
+            assert_eq!(lora[2], Value::from("org/adapter-a"));
+            assert_eq!(lora[3], Value::from("Qwen/Qwen1.5-0.5B-Chat"));
+
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-a",
+                        "base_model_name": "Qwen/Qwen1.5-0.5B-Chat"
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+/// `base_model_name` that doesn't match any served base model is silently
+/// dropped, matching Python's behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_lora_adapter_drops_nonmatching_base_model_name() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("add_lora"));
+
+            let args = array[3].as_array().expect("utility args");
+            let lora = args[0].as_array().expect("lora request tuple");
+            assert_eq!(lora[0], Value::from("adapter-a"));
+            assert_eq!(lora[3], Value::Nil);
+
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/load_lora_adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lora_name": "adapter-a",
+                        "lora_path": "org/adapter-a",
+                        "base_model_name": "some/other-model"
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
 
     drop(app);
     engine_task.finish().await;
@@ -4597,4 +4706,145 @@ async fn completions_empty_stop_string_returns_validation_error() {
         .expect("call app");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Both `--lora-modules` specs are loaded into the engine before the helper
+/// returns, and the adapters are subsequently visible via the LoRA-aware
+/// served-model registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_startup_loras_loads_each_spec_and_registers_models() {
+    let (state, engine_task) = test_admin_state_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for expected_int_id in 1u64..=2 {
+                let utility = recv_engine_message(dealer).await;
+                assert_eq!(utility[0].as_ref(), &[0x03]);
+
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                assert_eq!(array[2], Value::from("add_lora"));
+
+                let args = array[3].as_array().expect("utility args");
+                let lora = args[0].as_array().expect("lora request tuple");
+                assert_eq!(lora[1], Value::from(expected_int_id));
+
+                send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+            }
+        })
+    })
+    .await;
+
+    let specs = vec![
+        LoraModuleSpec {
+            name: "sql-lora".to_string(),
+            path: "/models/sql-lora".to_string(),
+            base_model_name: None,
+            is_3d_lora_weight: false,
+        },
+        LoraModuleSpec {
+            name: "code-lora".to_string(),
+            path: "/models/code-lora".to_string(),
+            base_model_name: Some("Qwen/Qwen1.5-0.5B-Chat".to_string()),
+            is_3d_lora_weight: true,
+        },
+    ];
+
+    load_startup_loras(&state, &specs).await.expect("startup LoRAs load");
+
+    let model_names = state.served_model_names_with_loras().await;
+    assert!(
+        model_names.iter().any(|name| name == "sql-lora"),
+        "served names should include sql-lora, got {model_names:?}"
+    );
+    assert!(
+        model_names.iter().any(|name| name == "code-lora"),
+        "served names should include code-lora, got {model_names:?}"
+    );
+
+    // End-to-end: the same router the production `serve()` path mounts must
+    // also surface the startup-loaded adapters on `/v1/models`.
+    let mut app = build_router_with_dev_mode_and_lora(state, true, true);
+    let response = app
+        .call(Request::builder().uri("/v1/models").body(Body::empty()).expect("build request"))
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let listed: BTreeSet<String> = json["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("model id").to_string())
+        .collect();
+    assert!(
+        listed.contains("sql-lora"),
+        "/v1/models should list sql-lora, got {listed:?}"
+    );
+    assert!(
+        listed.contains("code-lora"),
+        "/v1/models should list code-lora, got {listed:?}"
+    );
+
+    drop(app);
+    engine_task.finish().await;
+}
+
+/// If any startup spec fails to load, the helper returns an error carrying
+/// the offending module name so server startup aborts cleanly without binding
+/// the HTTP listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_startup_loras_aborts_on_failure() {
+    let (state, engine_task) = test_admin_state_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+            assert_eq!(array[2], Value::from("add_lora"));
+
+            // Engine reports the load failed; the helper should surface it
+            // as an Err before any subsequent spec is attempted.
+            send_outputs(push, utility_outputs(call_id, utility_result_value(false))).await;
+        })
+    })
+    .await;
+
+    let specs = vec![
+        LoraModuleSpec {
+            name: "broken-lora".to_string(),
+            path: "/models/broken-lora".to_string(),
+            base_model_name: None,
+            is_3d_lora_weight: false,
+        },
+        // Second spec should never be reached.
+        LoraModuleSpec {
+            name: "never-loaded".to_string(),
+            path: "/models/never-loaded".to_string(),
+            base_model_name: None,
+            is_3d_lora_weight: false,
+        },
+    ];
+
+    let error = load_startup_loras(&state, &specs)
+        .await
+        .expect_err("expected startup load to fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("broken-lora"),
+        "error should mention the failing module name, got: {message}"
+    );
+
+    let model_names = state.served_model_names_with_loras().await;
+    assert!(
+        !model_names.iter().any(|name| name == "broken-lora"),
+        "failed adapter must not be registered, got {model_names:?}"
+    );
+
+    drop(state);
+    engine_task.finish().await;
 }

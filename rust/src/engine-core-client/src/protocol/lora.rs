@@ -39,4 +39,10 @@ impl LoraRequest {
             is_3d_lora_weight,
         }
     }
+
+    /// Set the optional base model name and return self for chaining.
+    pub fn with_base_model_name(mut self, base_model_name: Option<String>) -> Self {
+        self.base_model_name = base_model_name;
+        self
+    }
 }

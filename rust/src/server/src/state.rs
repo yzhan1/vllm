@@ -113,6 +113,7 @@ impl AppState {
         lora_path: String,
         load_inplace: bool,
         is_3d_lora_weight: bool,
+        base_model_name: Option<String>,
     ) -> Result<LoraRequest, LoadLoraError> {
         self.lora_manager
             .load_lora(
@@ -122,6 +123,7 @@ impl AppState {
                 lora_path,
                 load_inplace,
                 is_3d_lora_weight,
+                base_model_name,
             )
             .await
     }

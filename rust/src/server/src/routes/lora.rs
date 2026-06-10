@@ -22,6 +22,10 @@ pub(crate) struct LoadLoraAdapterRequest {
     load_inplace: bool,
     #[serde(default)]
     is_3d_lora_weight: bool,
+    /// Optional base model the adapter targets. Applied to the engine request
+    /// only if it matches one of the served base model names.
+    #[serde(default)]
+    base_model_name: Option<String>,
 }
 
 impl Normalizable for LoadLoraAdapterRequest {}
@@ -127,6 +131,7 @@ pub async fn load_lora_adapter(
             lora_path,
             request.load_inplace,
             request.is_3d_lora_weight,
+            request.base_model_name,
         )
         .await
         .map_err(|error| match error {
